@@ -12,6 +12,32 @@ ocr = PaddleOCR(
     lang='en',
 )
 
+
+def preprocess_image(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    resized = cv2.resize(
+        gray,
+        None,
+        fx=2,
+        fy=2,
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+    blurred = cv2.GaussianBlur(resized, (3, 3), 0)
+
+    processed = cv2.adaptiveThreshold(
+        blurred,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        11,
+    )
+
+    return processed
+
+
 def extract_text_from_image(image_bytes: bytes):
     nparr = np.frombuffer(image_bytes, np.uint8)
     image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -19,7 +45,9 @@ def extract_text_from_image(image_bytes: bytes):
     if image is None:
         raise ValueError('Görüntü okunamadı')
 
-    result = ocr.ocr(image)
+    processed_image = preprocess_image(image)
+
+    result = ocr.ocr(processed_image)
 
     texts = []
 
