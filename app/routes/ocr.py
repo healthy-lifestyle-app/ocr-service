@@ -1,5 +1,7 @@
 from fastapi import APIRouter, File, UploadFile, HTTPException
 from app.services.ocr_engine import extract_text_from_image
+from app.services.parser import extract_nutrition_data
+from app.services.csv_writer import save_to_csv
 import traceback
 
 router = APIRouter()
@@ -11,8 +13,19 @@ async def extract_ocr(file: UploadFile = File(...)):
 
     try:
         image_bytes = await file.read()
+
         result = extract_text_from_image(image_bytes)
-        return result
+
+        parsed = extract_nutrition_data(result['text'])
+
+        save_to_csv(parsed)
+
+        return {
+            'raw_text': result['text'],
+            'lines': result['lines'],
+            'parsed': parsed,
+        }
+
     except ValueError as e:
         print('ValueError:', str(e))
         traceback.print_exc()
