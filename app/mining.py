@@ -3,6 +3,7 @@ from pathlib import Path
 import joblib
 import matplotlib.pyplot as plt
 import pandas as pd
+from sklearn import set_config
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -21,6 +22,8 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier
 
+
+set_config(transform_output='pandas')
 
 DATASET_PATH = Path('data/food_data.csv')
 RESULTS_DIR = Path('data/mining_results')
@@ -127,25 +130,6 @@ def build_models():
     except ImportError:
         print('UYARI: xgboost kurulu değil. XGBoost modeli atlandı.')
 
-    try:
-        from lightgbm import LGBMClassifier
-
-        models['lightgbm'] = Pipeline(
-            steps=[
-                ('imputer', SimpleImputer(strategy='median')),
-                (
-                    'model',
-                    LGBMClassifier(
-                        n_estimators=100,
-                        learning_rate=0.1,
-                        random_state=42,
-                    ),
-                ),
-            ],
-        )
-    except ImportError:
-        print('UYARI: lightgbm kurulu değil. LightGBM modeli atlandı.')
-
     return models
 
 
@@ -156,28 +140,28 @@ def normalize_boolean_columns(df: pd.DataFrame) -> pd.DataFrame:
         if column.startswith('contains_') or column == TARGET_COLUMN
     ]
 
+    bool_map = {
+        'true': 1,
+        'false': 0,
+        '1': 1,
+        '0': 0,
+        'yes': 1,
+        'no': 0,
+        'nan': 0,
+        'none': 0,
+        '': 0,
+    }
+
     for column in boolean_columns:
         df[column] = (
             df[column]
             .astype(str)
             .str.strip()
             .str.lower()
-            .replace(
-                {
-                    'true': 1,
-                    'false': 0,
-                    '1': 1,
-                    '0': 0,
-                    'yes': 1,
-                    'no': 0,
-                    'nan': 0,
-                    'none': 0,
-                    '': 0,
-                },
-            )
+            .map(bool_map)
+            .fillna(0)
+            .astype(int)
         )
-
-        df[column] = pd.to_numeric(df[column], errors='coerce').fillna(0).astype(int)
 
     return df
 
