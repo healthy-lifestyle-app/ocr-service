@@ -1,6 +1,101 @@
+# =========================
+# Python virtual environments
+# =========================
 .venv/
+venv/
+env/
+ENV/
+
+# =========================
+# Python cache / compiled files
+# =========================
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.py[cod]
+*$py.class
+
+# =========================
+# Test / type / lint caches
+# =========================
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# =========================
+# Environment / secrets
+# =========================
 .env
+.env.*
+!.env.example
+
+# =========================
+# IDE / editor folders
+# =========================
 .idea/
 .vscode/
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# Logs
+# =========================
+*.log
+logs/
+
+# =========================
+# PaddleOCR / Paddle cache and models
+# =========================
+.paddleocr/
+*.pdmodel
+*.pdiparams
+*.pdiparams.info
+*.onnx
+
+# =========================
+# Local data files
+# Bunlar kişisel / lokal veri, repoya gitmesin
+# =========================
+data/food_data.csv
+data/food_data_*.csv
+data/*food*.csv
+
+# =========================
+# Data mining generated outputs
+# Eğitim / analiz çıktıları repoya gitmesin
+# =========================
+data/mining_models/
+data/mining_results/
+data/mining_models_*/
+data/mining_results_*/
+
+# =========================
+# Backups
+# =========================
+data/backup*/
+backup*/
+backups/
+
+# =========================
+# Generated reports / temporary outputs
+# =========================
+*.joblib
+*.pkl
+*.pickle
+*.npy
+*.npz
+
+# =========================
+# Temporary files
+# =========================
+tmp/
+temp/
+*.tmp

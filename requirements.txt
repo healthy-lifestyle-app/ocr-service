@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-multipart
+
+numpy==1.26.4
+opencv-python==4.8.1.78
+opencv-contrib-python==4.8.1.78
+
+paddlepaddle==2.6.2
+paddleocr==2.7.3
