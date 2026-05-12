@@ -55,6 +55,7 @@ logs/
 # PaddleOCR / Paddle cache and models
 # =========================
 .paddleocr/
+.easyocr/
 *.pdmodel
 *.pdiparams
 *.pdiparams.info

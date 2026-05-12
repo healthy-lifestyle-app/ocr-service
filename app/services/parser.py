@@ -1,28 +1,37 @@
 import re
+from typing import Any
 
+import cv2
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# ALLERGEN & NUTRIENT KEYWORD TABLES
+# ---------------------------------------------------------------------------
 
 ALLERGEN_KEYWORDS = {
     'GLUTEN': [
         'gluten',
-        'gluten içeren tahıllar',
+        'glute',
         'gluten iceren tahillar',
+        'arpa',
+        'cavdar',
+        'yulaf',
     ],
     'WHEAT': [
         'wheat',
         'wheat flour',
-        'buğday',
         'bugday',
-        'buğday unu',
         'bugday unu',
     ],
     'PEANUT': [
         'peanut',
         'peanuts',
-        'yer fıstığı',
+        'peanuis',
         'yer fistigi',
         'yer fistik',
+        'yerfst',
         'fistik',
-        'fıstık',
     ],
     'SOY': [
         'soy',
@@ -35,51 +44,52 @@ ALLERGEN_KEYWORDS = {
     'MILK': [
         'milk',
         'milk solids',
-        'süt',
         'sut',
-        'sütlü',
         'sutlu',
-        'süt ürünü',
         'sut urunu',
-        'süt ürünleri',
         'sut urunleri',
         'laktoz',
         'lactose',
         'whey',
+        'peynir alti suyu',
         'kazein',
         'casein',
     ],
     'HAZELNUT': [
         'hazelnut',
-        'fındık',
+        'hazelnuts',
+        'hazehnut',
         'findik',
     ],
     'ALMOND': [
         'almond',
+        'almonds',
         'almnd',
         'badem',
     ],
     'WALNUT': [
         'walnut',
+        'walnuts',
         'ceviz',
     ],
     'CASHEW': [
         'cashew',
+        'cashews',
         'kaju',
     ],
     'PISTACHIO': [
         'pistachio',
+        'pistachios',
         'stachio',
-        'antep fıstığı',
         'antep fistigi',
     ],
     'EGG': [
         'egg',
+        'eggs',
         'yumurta',
     ],
     'FISH': [
         'fish',
-        'balık',
         'balik',
     ],
     'SESAME': [
@@ -98,19 +108,18 @@ ALLERGEN_KEYWORDS = {
     'SULFITES': [
         'sulfites',
         'sulphites',
-        'sülfit',
         'sulfit',
     ],
     'LUPIN': [
         'lupin',
-        'acı bakla',
         'aci bakla',
     ],
     'CRUSTACEANS': [
         'crustaceans',
+        'crustacean',
         'kabuklular',
+        'kabuklu',
         'karides',
-        'yengeç',
         'yengec',
     ],
     'MOLLUSCS': [
@@ -122,21 +131,82 @@ ALLERGEN_KEYWORDS = {
     ],
 }
 
+NUTRIENT_RANGES = {
+    'calories':      (0, 900),
+    'fat':           (0, 100),
+    'saturated_fat': (0, 100),
+    'carb':          (0, 100),
+    'sugar':         (0, 100),
+    'fiber':         (0, 100),
+    'protein':       (0, 100),
+    'salt':          (0, 20),
+}
+
+
+# ---------------------------------------------------------------------------
+# GÖRÜNTÜ ÖN İŞLEME
+# ---------------------------------------------------------------------------
+
+def preprocess_image(img: np.ndarray) -> np.ndarray:
+    """
+    EasyOCR doğruluğunu artırmak için görüntüyü ön işler.
+    BGR veya RGB numpy array kabul eder.
+    """
+    if len(img.shape) == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img.copy()
+
+    gray = cv2.convertScaleAbs(gray, alpha=1.5, beta=20)
+    denoised = cv2.fastNlMeansDenoising(gray, h=10)
+    _, thresh = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    return thresh
+
+
+def run_easyocr(reader, img: np.ndarray, confidence_threshold: float = 0.3):
+    """
+    EasyOCR'ı çalıştırır, confidence filtresi uygular.
+    Döner: (text: str, lines: list[str])
+
+    Kullanım:
+        import easyocr, cv2
+        reader = easyocr.Reader(['tr', 'en'])
+        img = cv2.imread('label.jpg')
+        text, lines = run_easyocr(reader, img)
+        result = extract_nutrition_data(text, lines)
+    """
+    processed = preprocess_image(img)
+    raw_result = reader.readtext(processed)
+
+    filtered = [item for item in raw_result if item[2] >= confidence_threshold]
+    if not filtered:
+        filtered = [item for item in raw_result if item[2] >= 0.1]
+
+    lines = [item[1] for item in filtered]
+    text = '\n'.join(lines)
+
+    return text, lines
+
+
+# ---------------------------------------------------------------------------
+# METİN NORMALİZASYONU
+# ---------------------------------------------------------------------------
 
 def normalize_text(text: str) -> str:
+    """Türkçe karakterleri ASCII'ye çevirir, küçük harf yapar."""
     if not text:
         return ''
 
-    text = text.lower()
+    text = str(text).lower()
 
     replacements = {
-        'ı': 'i',
-        'ğ': 'g',
-        'ü': 'u',
-        'ş': 's',
-        'ö': 'o',
-        'ç': 'c',
-        'İ': 'i',
+        'ı': 'i', 'İ': 'i',
+        'ğ': 'g', 'Ğ': 'g',
+        'ü': 'u', 'Ü': 'u',
+        'ş': 's', 'Ş': 's',
+        'ö': 'o', 'Ö': 'o',
+        'ç': 'c', 'Ç': 'c',
     }
 
     for old, new in replacements.items():
@@ -146,10 +216,87 @@ def normalize_text(text: str) -> str:
 
 
 def fix_common_ocr_errors(text: str) -> str:
+    """
+    normalize_text önce çalışır (Türkçe → ASCII),
+    ardından bilinen OCR hatalarını düzeltir.
+    Tüm key'ler normalize edilmiş (ASCII) halde.
+    """
     normalized = normalize_text(text)
 
     replacements = {
-        # Peanut / pistachio / nut OCR issues
+        # Genel ayraçlar
+        '|': ' ', ';': ' ', '：': ':', '–': '-', '—': '-',
+
+        # Kalori / enerji
+        'enerii': 'enerji',
+        'enerjı': 'enerji',
+        'enerji ve besin oan': 'enerji ve besin degeri',
+        'enerive': 'enerji ve',
+        'energyy': 'energy',
+        'kalori': 'calories',
+        'kkal': 'kcal',
+        'kca l': 'kcal',
+        'kca1': 'kcal',
+        'kcai': 'kcal',
+        'k cal': 'kcal',
+        'kcal)': 'kcal',
+
+        # Yağ
+        'yao': 'yag',
+        'tag': 'yag',
+        'yaf': 'yag',
+        'yaq': 'yag',
+        'yaglar': 'yag',
+
+        # Doymuş yağ
+        'doymusyag': 'doymus yag',
+        'sahated': 'saturated',
+        'saturaled': 'saturated',
+        'saturates': 'saturated',
+        'sat fat': 'saturated fat',
+
+        # Karbonhidrat
+        'karbohidrat': 'karbonhidrat',
+        'karbon hidrat': 'karbonhidrat',
+        'karber': 'karbonhidrat',
+        'carbohydrat': 'carbohydrate',
+        'carbohydratee': 'carbohydrate',
+        'carbonhydrate': 'carbohydrate',
+        'carbo hydrate': 'carbohydrate',
+        'sugars': 'sugar',
+
+        # Şeker
+        'seke': 'seker',
+        'skar': 'seker',
+        'sekerier': 'sekerler',
+        'scker': 'seker',
+
+        # Protein
+        'proteın': 'protein',
+        'prolein': 'protein',
+        'proteln': 'protein',
+        'protcin': 'protein',
+        'proicn': 'protein',
+
+        # Lif
+        'lifler': 'lif',
+        'libre': 'fibre',
+        'fbre': 'fibre',
+        'flbre': 'fibre',
+        'fber': 'fiber',
+
+        # Tuz
+        'sait': 'salt',
+        'sali': 'salt',
+        'salz': 'salt',
+        'sodlum': 'sodium',
+
+        # İçindekiler
+        'igindekiler': 'icindekiler',
+        'bar-igindekiler': 'icindekiler',
+        'bar-icindekiler': 'icindekiler',
+
+        # Fıstık
         'fistiku': 'fistik',
         'fistiki': 'fistik',
         'fistigi': 'fistik',
@@ -157,8 +304,10 @@ def fix_common_ocr_errors(text: str) -> str:
         'yerfg': 'yer fistik',
         'yer fg': 'yer fistik',
         'yerfq': 'yer fistik',
+        'yerfst': 'yer fistik',
+        'peanuis': 'peanuts',
 
-        # Milk / chocolate OCR issues
+        # Süt / çikolata
         'stlu': 'sutlu',
         'sutiu': 'sutlu',
         'suttu': 'sutlu',
@@ -166,91 +315,56 @@ def fix_common_ocr_errors(text: str) -> str:
         'stlikolata': 'sutlu cikolata',
         'ikolata': 'cikolata',
 
-        # English nut OCR issues
-        'almnd': 'almond',
+        # Kuruyemiş
         'almndstachio': 'almond pistachio',
         'almondstachio': 'almond pistachio',
         'almondpistachio': 'almond pistachio',
         'almondpisschio': 'almond pistachio',
         'almondpisfachio': 'almond pistachio',
+        'almnd': 'almond',
         'pistacio': 'pistachio',
-        'pistachıo': 'pistachio',
         'pisschio': 'pistachio',
         'pissachio': 'pistachio',
         'pisfachio': 'pistachio',
-
-        # Hazelnut OCR issues
         'hazalnut': 'hazelnut',
         'hasalnut': 'hazelnut',
         'hazeinut': 'hazelnut',
-
-        # Soy OCR issues
+        'hazehnut': 'hazelnut',
         'soypeanut': 'soy peanut',
-
-        # Sesame OCR issues
         'sesam': 'sesame',
 
-        # Gluten OCR issues
+        # Gluten
         'glufen': 'gluten',
         'guten': 'gluten',
         'giuten': 'gluten',
         'gluken': 'gluten',
         'gulen': 'gluten',
-
-        # Nutrition OCR issues
-        'karbohidrat': 'karbonhidrat',
-        'karber': 'karbonhidrat',
-        'carbohydrat': 'carbohydrate',
-        'carbonhydrate': 'carbohydrate',
-        'enerii': 'enerji',
-        'enerive': 'enerji ve',
-        'enerii ve besin oan': 'enerji ve besin degeri',
-        'besin oan': 'besin degeri',
-        'yao': 'yag',
-        'tag': 'yag',
-        'yaf': 'yag',
-        'fal': 'fat',
-        'sahated': 'saturated',
-        'saturaled': 'saturated',
-        'saturates': 'saturated',
-        'seke': 'seker',
-        'skar': 'seker',
-        'sekerier': 'sekerler',
-        'kalori': 'calories',
-        'kcal)': 'kcal',
-        'kkal)': 'kcal',
-        'proteın': 'protein',
-        'prolein': 'protein',
-        'proteln': 'protein',
-        'proteln ': 'protein ',
-        'libre': 'fibre',
-        'fbre': 'fibre',
-        'flbre': 'fibre',
-        'fber': 'fiber',
-        'sait': 'salt',
-        'sali': 'salt',
-
-        # Turkish dotted/undotted OCR style
-        'doymus yag': 'doymus yag',
-        'doymuş yag': 'doymus yag',
-        'doymus yağ': 'doymus yag',
     }
 
-    for wrong, correct in replacements.items():
-        normalized = normalized.replace(wrong, correct)
+    # Uzun yanlışları önce düzelt
+    for wrong in sorted(replacements.keys(), key=len, reverse=True):
+        normalized = normalized.replace(wrong, replacements[wrong])
 
-    return normalized
+    normalized = re.sub(r'\s+', ' ', normalized)
+    normalized = normalized.replace(' / ', '/')
+
+    return normalized.strip()
 
 
-def to_float(value: str | float | int | None):
+# ---------------------------------------------------------------------------
+# SAYI ARAÇLARI
+# ---------------------------------------------------------------------------
+
+def to_float(value) -> float | None:
     if value is None:
         return None
 
     value = str(value).strip()
     value = value.replace(',', '.')
+    value = value.replace('O', '0').replace('o', '0')
+    value = re.sub(r'(\d)\s*\.\s*(\d)', r'\1.\2', value)
 
     match = re.search(r'\d+(?:\.\d+)?', value)
-
     if not match:
         return None
 
@@ -261,236 +375,170 @@ def to_float(value: str | float | int | None):
 
 
 def extract_numbers(line: str) -> list[float]:
-    matches = re.findall(r'\d+(?:[.,]\d+)?', line)
+    if not line:
+        return []
+
+    matches = re.findall(r'\d+(?:[.,]\d+)?', str(line))
     numbers = []
 
     for match in matches:
         value = to_float(match)
-
         if value is not None:
             numbers.append(value)
 
     return numbers
 
 
-def infer_decimal_from_ocr_integer(
-    value: float,
-    nutrient: str,
-) -> float:
-    """
-    OCR bazen 7,2 -> 72 veya 2,3 -> 23 gibi okuyabiliyor.
-    Protein/lif/tuz gibi alanlarda güvenli ondalık düzeltmesi yapar.
-    Yağ/şeker/doymuş yağ için otomatik bölme yapmaz; çünkü 25, 38, 16
-    gibi değerler gerçek 100 g değerleri olabilir.
-    """
-
+def clean_number(value: Any):
     if value is None:
-        return value
+        return None
 
-    if not float(value).is_integer():
-        return value
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
 
-    value = float(value)
+    value = round(value, 3)
 
-    if nutrient == 'salt':
-        if 10 < value < 100:
-            return round(value / 10, 2)
-
-    if nutrient in {'protein', 'fiber'}:
-        if 10 < value < 100:
-            return round(value / 10, 2)
+    if float(value).is_integer():
+        return int(value)
 
     return value
 
 
-def normalize_nutrient_value(
-    value: float,
-    nutrient: str,
-) -> float | None:
+def normalize_nutrient_value(value: float | None, nutrient: str):
     if value is None:
         return None
 
-    value = float(value)
-    value = infer_decimal_from_ocr_integer(value, nutrient)
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
 
-    realistic_ranges = {
-        'fat': (0, 80),
-        'saturated_fat': (0, 60),
-        'carb': (0, 100),
-        'sugar': (0, 100),
-        'fiber': (0, 40),
-        'protein': (0, 60),
-        'salt': (0, 10),
-    }
+    # Tuz: OCR bazen 0.43 → 43 gibi okuyabiliyor
+    if nutrient == 'salt':
+        if 10 < value < 100:
+            value = value / 10
+        elif value >= 100:
+            value = value / 100
 
-    min_value, max_value = realistic_ranges.get(nutrient, (0, 100))
+    # Protein / lif: OCR bazen 6.5 → 65 gibi okuyabiliyor
+    if nutrient in {'protein', 'fiber'}:
+        if 60 < value < 100:
+            value = value / 10
+
+    min_value, max_value = NUTRIENT_RANGES.get(nutrient, (0, 100))
 
     if value < min_value or value > max_value:
         return None
 
-    return value
+    return clean_number(value)
 
+
+# ---------------------------------------------------------------------------
+# SATIR ARAÇLARI
+# ---------------------------------------------------------------------------
+
+def get_lines_from_text(text: str) -> list[str]:
+    if not text:
+        return []
+
+    raw_lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+    return [fix_common_ocr_errors(line) for line in raw_lines if line.strip()]
+
+
+# ---------------------------------------------------------------------------
+# FİLTRE FONKSİYONLARI
+# ---------------------------------------------------------------------------
 
 def is_noise_line(line: str) -> bool:
     lower_line = fix_common_ocr_errors(line)
 
     noise_words = [
-        'prod.code',
-        'prod code',
-        'cesit no',
-        'registration',
-        'kayit',
-        'ref.no',
-        'refno',
-        'relno',
-        'barcode',
-        'www',
-        'http',
-        '.com',
-        'tel',
-        'iletisim',
-        'ureticifirma',
-        'uretici firma',
-        'firma',
-        'san.',
-        'tic.',
-        'mahallesi',
-        'caddesi',
-        'sokak',
-        'istanbul',
-        'turkiye',
-        'origin',
-        'mensei',
-        'lot',
-        'tett',
-        'bbd',
-        'best before',
-        'date',
-        'ambalaj',
-        'packaging',
-        'halal',
-        'certificated',
-        'sertifika',
-        'sertificated',
-        'gida kodeksi',
-        'turk gida',
-        'registration number',
+        'prod.code', 'prod code', 'cesit no', 'registration',
+        'kayit', 'ref.no', 'refno', 'relno', 'barcode',
+        'www', 'http', '.com', 'iletisim',
+        'ureticifirma', 'uretici firma', 'san.', 'tic.',
+        'mahallesi', 'caddesi', 'sokak', 'istanbul', 'turkiye',
+        'origin', 'mensei', 'lot', 'tett', 'bbd', 'best before',
+        'ambalaj', 'packaging', 'halal', 'certificated',
+        'sertifika', 'gida kodeksi', 'turk gida', 'registration number',
     ]
 
     return any(word in lower_line for word in noise_words)
 
 
-def is_serving_or_reference_line(line: str) -> bool:
+def is_reference_line(line: str) -> bool:
+    """
+    Sadece başlık/porsiyon satırlarını filtreler.
+    İçinde besin kelimesi varsa filtreleme — değer içeriyor olabilir.
+    """
     lower_line = fix_common_ocr_errors(line)
 
-    if 'amount per' in lower_line:
-        return True
+    nutrient_words = [
+        'energy', 'enerji', 'kcal', 'kj',
+        'yag', 'fat', 'doymus', 'saturated',
+        'karbonhidrat', 'carbohydrate',
+        'seker', 'sugar', 'lif', 'fiber', 'fibre',
+        'protein', 'tuz', 'salt',
+    ]
 
-    if 'nutrition facts' in lower_line:
-        return True
+    if any(word in lower_line for word in nutrient_words):
+        return False
 
-    if 'besin ogeleri' in lower_line:
-        return True
+    reference_patterns = [
+        r'\b100\s*(g|gr|gram|ml)\b',
+        r'\bper\s*100\s*(g|gr|gram|ml)\b',
+        r'\b\d+\s*(g|gr|gram|ml)\s*%\s*ra\b',
+        r'\bamount\s*per\b',
+        r'\bnutrition\s*facts\b',
+        r'\bbesin\s*ogeleri\b',
+        r'\bnet\s*weight\b',
+    ]
 
-    if 'net weight' in lower_line:
-        return True
-
-    if re.search(r'\b\d+\s*(g|gr|ml)\s*%\s*ra\b', lower_line):
-        return True
-
-    # Sadece başlık gibi duran 100g / porsiyon satırlarını ele.
-    numbers = extract_numbers(lower_line)
-    has_nutrient_word = any(
-        word in lower_line
-        for word in [
-            'yag',
-            'fat',
-            'doymus',
-            'saturated',
-            'karbonhidrat',
-            'carbohydrate',
-            'seker',
-            'sugar',
-            'lif',
-            'fiber',
-            'fibre',
-            'protein',
-            'tuz',
-            'salt',
-            'enerji',
-            'energy',
-            'kcal',
-        ]
-    )
-
-    if not has_nutrient_word:
-        if re.search(r'\b100\s*(g|gr|ml|da)\b', lower_line):
-            return True
-
-        if re.search(r'\b(25|30|34|36|40|50)\s*(g|gr|ml)\b', lower_line):
-            return True
-
-        if '1.41oz' in lower_line or '1.41 oz' in lower_line:
-            return True
-
-    return False
+    return any(re.search(pattern, lower_line) for pattern in reference_patterns)
 
 
 def is_invalid_candidate_line(line: str) -> bool:
-    if not line:
+    if not line or not str(line).strip():
         return True
-
     if is_noise_line(line):
         return True
-
-    if is_serving_or_reference_line(line):
+    if is_reference_line(line):
         return True
-
-    # % işaretli satırları artık direkt silmiyoruz.
-    # Çünkü Lay's gibi tablolarda aynı satırda %RA bulunabiliyor.
-
     return False
 
 
+# ---------------------------------------------------------------------------
+# İÇERİK & ALERJEN
+# ---------------------------------------------------------------------------
+
 def extract_ingredient_text(text: str) -> str:
+    if not text:
+        return ''
+
     normalized = fix_common_ocr_errors(text)
 
     start_keywords = [
-        'icindekiler',
-        'bar-igindekiler',
-        'bar-icindekiler',
-        'igindekiler',
-        'ingredients',
-        'alerjen',
-        'allergen',
-        'contains',
-        'may contain',
-        'also handles products containing',
-        'icerir',
-        'icerebilir',
+        'icindekiler', 'ingredients', 'alerjen', 'allergen',
+        'contains', 'may contain', 'icerir', 'icerebilir',
     ]
 
     stop_keywords = [
-        'nutrition facts',
-        'besin ogeleri',
-        'enerji',
-        'energy',
-        'amount per',
-        'net weight',
-        'tavsiye edilen',
-        'best before',
+        'nutrition facts', 'besin ogeleri', 'enerji',
+        'energy', 'amount per', 'net weight',
+        'tavsiye edilen', 'best before',
     ]
 
     best_index = None
 
     for keyword in start_keywords:
-        index = normalized.find(normalize_text(keyword))
-
+        index = normalized.find(fix_common_ocr_errors(keyword))
         if index != -1 and (best_index is None or index < best_index):
             best_index = index
 
     if best_index is None:
-        return text
+        return text.strip()
 
     ingredient_part = text[best_index:]
     normalized_ingredient_part = fix_common_ocr_errors(ingredient_part)
@@ -498,8 +546,7 @@ def extract_ingredient_text(text: str) -> str:
     stop_index = None
 
     for keyword in stop_keywords:
-        index = normalized_ingredient_part.find(normalize_text(keyword))
-
+        index = normalized_ingredient_part.find(fix_common_ocr_errors(keyword))
         if index > 20 and (stop_index is None or index < stop_index):
             stop_index = index
 
@@ -516,11 +563,10 @@ def detect_allergens(text: str) -> list[str]:
     for allergen_code, keywords in ALLERGEN_KEYWORDS.items():
         for keyword in keywords:
             normalized_keyword = fix_common_ocr_errors(keyword)
+            if not normalized_keyword:
+                continue
 
-            boundary_pattern = (
-                rf'(?<![a-zA-Z]){re.escape(normalized_keyword)}(?![a-zA-Z])'
-            )
-
+            boundary_pattern = rf'(?<![a-zA-Z]){re.escape(normalized_keyword)}(?![a-zA-Z])'
             substring_allowed = len(normalized_keyword) >= 5
 
             if re.search(boundary_pattern, normalized_text) or (
@@ -532,269 +578,90 @@ def detect_allergens(text: str) -> list[str]:
     return detected
 
 
-def is_value_valid_for_nutrient(
-    value: float,
-    min_value: float,
-    max_value: float,
-    allow_zero: bool = True,
-) -> bool:
-    if value is None:
-        return False
+# ---------------------------------------------------------------------------
+# DEĞER BULMA — ORTAK YAPI
+# ---------------------------------------------------------------------------
 
-    if not allow_zero and value == 0:
-        return False
+def choose_best_number(numbers: list[float], nutrient: str) -> float | None:
+    """
+    Sayı listesinden 100g değerini seç.
+    Porsiyon başlıklarını ve 100g başlığını atla, ilk geçerli sayıyı döndür.
+    """
+    if not numbers:
+        return None
 
-    if value < min_value:
-        return False
-
-    if value > max_value:
-        return False
-
-    if value == 100:
-        return False
-
-    return True
-
-
-def clean_table_numbers(
-    numbers: list[float],
-    nutrient: str,
-) -> list[float]:
     cleaned = []
 
     for number in numbers:
-        # 100g başlığı
         if number == 100:
             continue
 
-        # Porsiyon gramajları. 25g gerçek yağ değeri de olabilir, fat için izin ver.
-        if number in [25, 30, 34, 36, 40, 50]:
-            if not (nutrient == 'fat' and number == 25):
-                continue
+        # Porsiyon gramajı olabilecek sayılar — yağ hariç atla
+        if nutrient != 'fat' and number in {25, 30, 34, 36, 40, 50}:
+            continue
 
         normalized = normalize_nutrient_value(number, nutrient)
-
         if normalized is not None:
             cleaned.append(normalized)
 
-    return cleaned
+    return cleaned[0] if cleaned else None
 
 
-def choose_100g_value_from_numbers(
-    numbers: list[float],
-    nutrient: str,
-) -> float | None:
-    cleaned = clean_table_numbers(numbers, nutrient)
-
-    if not cleaned:
-        return None
-
-    # 100g | porsiyon | %RA formatında ilk gerçek değer genelde 100g değeridir.
-    return cleaned[0]
-
-
-def find_value_on_same_line(
+def find_value_by_keywords(
     lines: list[str],
     keywords: list[str],
-    max_valid_value: float | None = None,
-):
-    normalized_keywords = [fix_common_ocr_errors(keyword) for keyword in keywords]
+    nutrient: str,
+    search_window: int = 3,
+) -> float | None:
+    """
+    Satırları tara, keyword bulunan satırdan itibaren search_window satır içinde
+    geçerli sayıyı bul.
+    """
+    normalized_keywords = [fix_common_ocr_errors(k) for k in keywords]
 
-    for line in lines:
+    for index, line in enumerate(lines):
         lower_line = fix_common_ocr_errors(line)
 
-        if not any(keyword in lower_line for keyword in normalized_keywords):
+        if not any(kw in lower_line for kw in normalized_keywords):
             continue
 
-        if is_invalid_candidate_line(line):
+        # Yağ satırı doymuş yağa kaymasın
+        if nutrient == 'fat' and ('doymus' in lower_line or 'saturated' in lower_line):
             continue
 
-        numbers = extract_numbers(line)
-
-        if not numbers:
+        # Karbonhidrat satırı şekere kaymasın
+        if nutrient == 'carb' and ('seker' in lower_line or 'sugar' in lower_line):
             continue
 
-        valid_numbers = []
+        window = lines[index: index + search_window + 1]
 
-        for number in numbers:
-            if number < 0:
+        for candidate_line in window:
+            if is_invalid_candidate_line(candidate_line):
                 continue
 
-            if number == 100:
-                continue
+            candidate_lower = fix_common_ocr_errors(candidate_line)
 
-            if max_valid_value is not None and number > max_valid_value:
-                continue
-
-            valid_numbers.append(number)
-
-        if valid_numbers:
-            return valid_numbers[-1]
-
-    return None
-
-
-def find_first_valid_number_near_label(
-    lines: list[str],
-    label_keywords: list[str],
-    min_value: float = 0,
-    max_value: float = 100,
-    search_window: int = 5,
-    allow_zero: bool = True,
-    nutrient: str = '',
-):
-    normalized_keywords = [fix_common_ocr_errors(keyword) for keyword in label_keywords]
-
-    for i, line in enumerate(lines):
-        lower_line = fix_common_ocr_errors(line)
-
-        if not any(keyword in lower_line for keyword in normalized_keywords):
-            continue
-
-        search_area = lines[i : min(i + search_window + 1, len(lines))]
-        candidate_values: list[float] = []
-
-        for candidate in search_area:
-            candidate_lower = fix_common_ocr_errors(candidate)
-
-            if is_invalid_candidate_line(candidate):
+            # Yağ penceresinde doymuş yağa geçme
+            if nutrient == 'fat' and ('doymus' in candidate_lower or 'saturated' in candidate_lower):
                 continue
 
             numbers = extract_numbers(candidate_lower)
-            chosen_value = choose_100g_value_from_numbers(numbers, nutrient)
+            value = choose_best_number(numbers, nutrient)
 
-            if chosen_value is None:
-                continue
-
-            if is_value_valid_for_nutrient(
-                chosen_value,
-                min_value=min_value,
-                max_value=max_value,
-                allow_zero=allow_zero,
-            ):
-                candidate_values.append(chosen_value)
-
-        if candidate_values:
-            return candidate_values[0]
+            if value is not None:
+                return value
 
     return None
 
 
-def find_larger_value_near_label(
-    lines: list[str],
-    label_keywords: list[str],
-    min_value: float = 5,
-    max_value: float = 100,
-    search_window: int = 6,
-    exclude_keywords: list[str] | None = None,
-):
-    normalized_keywords = [fix_common_ocr_errors(keyword) for keyword in label_keywords]
-    normalized_excludes = [
-        fix_common_ocr_errors(keyword)
-        for keyword in (exclude_keywords or [])
-    ]
+# ---------------------------------------------------------------------------
+# KALORİ — ÖZEL MANTIK
+# ---------------------------------------------------------------------------
 
-    for i, line in enumerate(lines):
-        lower_line = fix_common_ocr_errors(line)
-
-        if not any(keyword in lower_line for keyword in normalized_keywords):
-            continue
-
-        if any(keyword in lower_line for keyword in normalized_excludes):
-            continue
-
-        search_area = lines[i : min(i + search_window + 1, len(lines))]
-        candidates: list[float] = []
-
-        for candidate in search_area:
-            candidate_lower = fix_common_ocr_errors(candidate)
-
-            if is_invalid_candidate_line(candidate):
-                continue
-
-            if any(keyword in candidate_lower for keyword in normalized_excludes):
-                continue
-
-            numbers = extract_numbers(candidate_lower)
-
-            for number in numbers:
-                if min_value <= number <= max_value and number not in [40, 100]:
-                    candidates.append(number)
-
-        if candidates:
-            return candidates[0]
-
-    return None
-
-
-def find_value_by_table_order(
-    lines: list[str],
-    target_nutrient: str,
-):
-    nutrient_keywords = {
-        'fat': ['yag', 'fat'],
-        'saturated_fat': ['doymus', 'saturated'],
-        'carb': ['karbonhidrat', 'carbohydrate'],
-        'sugar': ['seker', 'sugar'],
-        'fiber': ['lif', 'fiber', 'fibre'],
-        'protein': ['protein'],
-        'salt': ['tuz', 'salt'],
-    }
-
-    min_max = {
-        'fat': (0, 80),
-        'saturated_fat': (0, 60),
-        'carb': (0, 100),
-        'sugar': (0, 100),
-        'fiber': (0, 40),
-        'protein': (0, 60),
-        'salt': (0, 10),
-    }
-
-    keywords = nutrient_keywords[target_nutrient]
-    min_value, max_value = min_max[target_nutrient]
-
-    for i, line in enumerate(lines):
-        lower_line = fix_common_ocr_errors(line)
-
-        if not any(keyword in lower_line for keyword in keywords):
-            continue
-
-        # Satırda sayı yoksa hemen alt satırlara da bak.
-        search_area = lines[i : min(i + 4, len(lines))]
-
-        for candidate in search_area:
-            candidate_lower = fix_common_ocr_errors(candidate)
-
-            if is_invalid_candidate_line(candidate):
-                continue
-
-            # Carb satırında sugar değerine kaymasın, fat satırında saturated'a kaymasın.
-            if target_nutrient == 'fat' and (
-                'doymus' in candidate_lower or 'saturated' in candidate_lower
-            ):
-                continue
-
-            if target_nutrient == 'carb' and (
-                'seker' in candidate_lower or 'sugar' in candidate_lower
-            ):
-                continue
-
-            numbers = extract_numbers(candidate_lower)
-            chosen = choose_100g_value_from_numbers(numbers, target_nutrient)
-
-            if chosen is None:
-                continue
-
-            if min_value <= chosen <= max_value:
-                return chosen
-
-    return None
-
-
-def find_calories(lines: list[str], text: str):
+def find_calories(lines: list[str], text: str) -> int | float | None:
     clean_text = fix_common_ocr_errors(text)
 
+    # 1. "446 kcal" gibi doğrudan eşleşme — en güvenilir yol
     kcal_matches = re.findall(
         r'(\d+(?:[.,]\d+)?)\s*(kcal|kkal)',
         clean_text,
@@ -803,180 +670,163 @@ def find_calories(lines: list[str], text: str):
 
     for match in kcal_matches:
         value = to_float(match[0])
+        if value is not None and 180 <= value <= 900:
+            return clean_number(value)
 
-        if value is not None and 180 <= value <= 900 and value != 100:
-            return int(value) if value.is_integer() else value
-
-    for i, line in enumerate(lines):
+    # 2. Enerji satırında kJ ve kcal karışıksa — kcal inline ara
+    for index, line in enumerate(lines):
         lower_line = fix_common_ocr_errors(line)
 
-        if not any(word in lower_line for word in ['enerji', 'energy', 'kcal', 'kkal']):
+        if not any(word in lower_line for word in ['enerji', 'energy', 'kcal', 'kj', 'calories']):
             continue
 
-        search_area = lines[max(0, i - 2) : min(i + 6, len(lines))]
+        # Sadece kJ satırını atla
+        if 'kj' in lower_line and 'kcal' not in lower_line:
+            continue
 
-        for current_line in search_area:
-            current_lower = fix_common_ocr_errors(current_line)
+        window = lines[max(0, index - 1): min(index + 4, len(lines))]
 
+        for current_line in window:
             if is_invalid_candidate_line(current_line):
                 continue
 
-            numbers = extract_numbers(current_lower)
+            current_lower = fix_common_ocr_errors(current_line)
 
-            candidates = [
-                number
-                for number in numbers
-                if 180 <= number <= 900 and number != 100
-            ]
+            # Satır içinde "kcal" varsa o sayıyı al
+            kcal_inline = re.search(
+                r'(\d+(?:[.,]\d+)?)\s*(kcal|kkal)',
+                current_lower,
+                re.IGNORECASE,
+            )
+            if kcal_inline:
+                value = to_float(kcal_inline.group(1))
+                if value is not None and 180 <= value <= 900:
+                    return clean_number(value)
+
+            numbers = extract_numbers(current_lower)
+            # 100g değeri tabloda daima ilk gelir, porsiyon değeri sonra
+            candidates = [n for n in numbers if 180 <= n <= 900]
 
             if candidates:
-                value = candidates[-1]
-                return int(value) if value.is_integer() else value
+                return clean_number(candidates[0])
+
+    # 3. Son çare: tüm metinde 180-900 arası ilk sayı
+    all_numbers = extract_numbers(clean_text)
+    candidates = [n for n in all_numbers if 180 <= n <= 900]
+
+    if candidates:
+        return clean_number(candidates[0])
 
     return None
 
 
-def find_fat_value(lines: list[str]):
-    value = find_value_by_table_order(lines, 'fat')
+# ---------------------------------------------------------------------------
+# BESİN DEĞERİ BULUCULAR
+# ---------------------------------------------------------------------------
 
-    if value is not None:
-        return value
-
-    return find_first_valid_number_near_label(
+def find_fat_value(lines: list[str]) -> float | None:
+    return find_value_by_keywords(
         lines,
-        ['yag/fat', 'yağ/fat', 'yag', 'yağ', 'fat'],
-        min_value=0,
-        max_value=80,
-        search_window=5,
-        nutrient='fat',
+        ['yag/fat', 'yag', 'fat'],
+        'fat',
+        search_window=3,
     )
 
 
-def find_saturated_fat_value(lines: list[str]):
-    value = find_value_by_table_order(lines, 'saturated_fat')
-
-    if value is not None:
-        return value
-
-    return find_first_valid_number_near_label(
+def find_saturated_fat_value(lines: list[str]) -> float | None:
+    return find_value_by_keywords(
         lines,
-        ['doymus yag', 'doymuş yağ', 'saturated'],
-        min_value=0,
-        max_value=60,
-        search_window=6,
-        nutrient='saturated_fat',
+        ['doymus yag', 'saturated fat', 'saturated', 'doymus'],
+        'saturated_fat',
+        search_window=4,
     )
 
 
-def find_carb_value(lines: list[str]):
-    value = find_value_by_table_order(lines, 'carb')
-
-    if value is not None:
-        return value
-
-    return find_first_valid_number_near_label(
+def find_carb_value(lines: list[str]) -> float | None:
+    return find_value_by_keywords(
         lines,
-        ['karbonhidrat', 'carbohydrate', 'carb'],
-        min_value=0,
-        max_value=100,
-        search_window=5,
-        nutrient='carb',
+        ['karbonhidrat', 'carbohydrate', 'carbs', 'carb'],
+        'carb',
+        search_window=3,
     )
 
 
-def find_sugar_value(lines: list[str]):
-    value = find_value_by_table_order(lines, 'sugar')
-
-    if value is not None:
-        return value
-
-    return find_first_valid_number_near_label(
+def find_sugar_value(lines: list[str]) -> float | None:
+    return find_value_by_keywords(
         lines,
-        ['sekerler', 'şekerler', 'seker', 'şeker', 'sugars', 'sugar'],
-        min_value=0,
-        max_value=100,
-        search_window=6,
-        nutrient='sugar',
+        ['sekerler', 'seker', 'sugar'],
+        'sugar',
+        search_window=4,
     )
 
 
-def find_fiber_value(lines: list[str]):
-    value = find_value_by_table_order(lines, 'fiber')
-
-    if value is not None:
-        return value
-
-    return find_first_valid_number_near_label(
+def find_fiber_value(lines: list[str]) -> float | None:
+    return find_value_by_keywords(
         lines,
         ['lif', 'fiber', 'fibre'],
-        min_value=0,
-        max_value=40,
-        search_window=4,
-        nutrient='fiber',
+        'fiber',
+        search_window=3,
     )
 
 
-def find_protein_value(lines: list[str]):
-    value = find_value_by_table_order(lines, 'protein')
-
-    if value is not None:
-        return value
-
-    return find_first_valid_number_near_label(
+def find_protein_value(lines: list[str]) -> float | None:
+    return find_value_by_keywords(
         lines,
         ['protein'],
-        min_value=0,
-        max_value=60,
-        search_window=5,
-        nutrient='protein',
-    )
-
-
-def find_salt_value(lines: list[str]):
-    value = find_value_by_table_order(lines, 'salt')
-
-    if value is not None:
-        return value
-
-    return find_first_valid_number_near_label(
-        lines,
-        ['tuz', 'salt', 'salz'],
-        min_value=0,
-        max_value=10,
+        'protein',
         search_window=4,
-        nutrient='salt',
     )
 
 
-def clean_number(value):
-    if value is None:
-        return None
+def find_salt_value(lines: list[str]) -> float | None:
+    return find_value_by_keywords(
+        lines,
+        ['tuz', 'salt', 'sodium'],
+        'salt',
+        search_window=3,
+    )
 
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
 
-    return value
+# ---------------------------------------------------------------------------
+# ANA PARSER
+# ---------------------------------------------------------------------------
 
+def extract_nutrition_data(text: str, lines: list[str] | None = None) -> dict:
+    """
+    Ana parser — iki kullanım şekli:
 
-def extract_nutrition_data(text: str):
-    fixed_text = fix_common_ocr_errors(text)
-    lines = [line.strip() for line in fixed_text.split('\n') if line.strip()]
+    A) Sadece metin:
+        result = extract_nutrition_data(text)
 
-    ingredient_text = extract_ingredient_text(text)
-    detected_allergens = detect_allergens(text)
+    B) run_easyocr ile (önerilen):
+        text, lines = run_easyocr(reader, img)
+        result = extract_nutrition_data(text, lines)
+    """
+    raw_text = text or ''
 
-    data = {
-        'calories': clean_number(find_calories(lines, fixed_text)),
-        'protein': clean_number(find_protein_value(lines)),
-        'carb': clean_number(find_carb_value(lines)),
-        'sugar': clean_number(find_sugar_value(lines)),
-        'fat': clean_number(find_fat_value(lines)),
-        'saturated_fat': clean_number(find_saturated_fat_value(lines)),
-        'fiber': clean_number(find_fiber_value(lines)),
-        'salt': clean_number(find_salt_value(lines)),
-        'ingredients_text': ingredient_text,
+    if lines:
+        fixed_lines = [fix_common_ocr_errors(line) for line in lines if line.strip()]
+        fixed_text = fix_common_ocr_errors(raw_text + '\n' + '\n'.join(lines))
+    else:
+        fixed_lines = get_lines_from_text(raw_text)
+        fixed_text = fix_common_ocr_errors(raw_text)
+
+    ingredient_text = extract_ingredient_text(raw_text)
+    detected_allergens = detect_allergens(raw_text)
+
+    carb = find_carb_value(fixed_lines)
+
+    return {
+        'calories':           clean_number(find_calories(fixed_lines, fixed_text)),
+        'fat':                clean_number(find_fat_value(fixed_lines)),
+        'saturated_fat':      clean_number(find_saturated_fat_value(fixed_lines)),
+        'carb':               clean_number(carb),
+        'carbs':              clean_number(carb),
+        'sugar':              clean_number(find_sugar_value(fixed_lines)),
+        'fiber':              clean_number(find_fiber_value(fixed_lines)),
+        'protein':            clean_number(find_protein_value(fixed_lines)),
+        'salt':               clean_number(find_salt_value(fixed_lines)),
+        'ingredients_text':   ingredient_text,
         'detected_allergens': detected_allergens,
-        'has_allergen_risk': len(detected_allergens) > 0,
+        'has_allergen_risk':  len(detected_allergens) > 0,
     }
-
-    return data

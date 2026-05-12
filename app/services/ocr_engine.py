@@ -1,20 +1,22 @@
-import os
 import re
+import time
+from pathlib import Path
 from typing import Any
 
-os.environ['FLAGS_use_mkldnn'] = '0'
-os.environ['OMP_NUM_THREADS'] = '1'
-
 import cv2
+import easyocr
 import numpy as np
-from paddleocr import PaddleOCR
 
 
-ocr = PaddleOCR(
-    use_angle_cls=True,
-    lang='en',
+MODEL_DIR = Path(__file__).resolve().parents[2] / '.easyocr'
+USER_NETWORK_DIR = MODEL_DIR / 'user_network'
+
+reader = easyocr.Reader(
+    ['tr', 'en'],
+    gpu=False,
+    model_storage_directory=str(MODEL_DIR),
+    user_network_directory=str(USER_NETWORK_DIR),
 )
-
 
 OCR_KEYWORDS = [
     'energy',
@@ -24,7 +26,6 @@ OCR_KEYWORDS = [
     'calorie',
     'kalori',
     'protein',
-    'proteinler',
     'carbohydrate',
     'karbonhidrat',
     'carbs',
@@ -41,7 +42,6 @@ OCR_KEYWORDS = [
     'lif',
     'salt',
     'tuz',
-    'sodium',
     'ingredients',
     'icindekiler',
     'içindekiler',
@@ -59,18 +59,65 @@ OCR_KEYWORDS = [
     'peanut',
     'yer fistigi',
     'yer fıstığı',
-    'almond',
-    'badem',
-    'pistachio',
-    'antep',
-    'walnut',
-    'ceviz',
     'hazelnut',
     'findik',
     'fındık',
-    'sesame',
-    'susam',
 ]
+
+NUTRITION_ALLOWLIST = (
+    '0123456789.,/%kjKJkcalKCALgGrRmlML '
+    'enerjiENERJIyağYAGdoymuşDOYMUS'
+    'karbonhidratKARBONHIDRATşekerSEKER'
+    'proteinPROTEINlifLIFtuzTUZsaltSALT'
+    'fatFATcarbsCARBSsugarSUGARfiberFIBER'
+)
+
+OCR_MODES = [
+    (
+        'general',
+        {
+            'decoder': 'beamsearch',
+            'beamWidth': 10,
+            'contrast_ths': 0.05,
+            'adjust_contrast': 0.7,
+            'text_threshold': 0.4,
+            'low_text': 0.25,
+            'link_threshold': 0.25,
+            'width_ths': 0.3,
+            'add_margin': 0.05,
+            'mag_ratio': 1.5,
+        },
+    ),
+    (
+        'nutrition_numeric',
+        {
+            'decoder': 'beamsearch',
+            'beamWidth': 10,
+            'allowlist': NUTRITION_ALLOWLIST,
+            'contrast_ths': 0.05,
+            'adjust_contrast': 0.7,
+            'text_threshold': 0.35,
+            'low_text': 0.2,
+            'link_threshold': 0.2,
+            'width_ths': 0.2,
+            'add_margin': 0.08,
+            'mag_ratio': 2.0,
+        },
+    ),
+]
+
+FAST_OCR_OPTIONS = {
+    'decoder': 'beamsearch',
+    'beamWidth': 5,
+    'contrast_ths': 0.05,
+    'adjust_contrast': 0.7,
+    'text_threshold': 0.35,
+    'low_text': 0.25,
+    'link_threshold': 0.25,
+    'width_ths': 0.35,
+    'add_margin': 0.04,
+    'mag_ratio': 1.2,
+}
 
 
 def decode_image(image_bytes: bytes) -> np.ndarray:
@@ -83,39 +130,27 @@ def decode_image(image_bytes: bytes) -> np.ndarray:
     return image
 
 
-def calculate_image_quality(image: np.ndarray) -> dict[str, Any]:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+def resize_to_max_side(image: np.ndarray, max_side: int) -> np.ndarray:
+    height, width = image.shape[:2]
+    longest_side = max(height, width)
 
-    blur_score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-    brightness = float(np.mean(gray))
-    contrast = float(np.std(gray))
+    if longest_side <= max_side:
+        return image
 
-    overexposed_ratio = float(np.mean(gray > 245))
-    underexposed_ratio = float(np.mean(gray < 25))
+    scale = max_side / longest_side
+    resized_width = max(1, int(width * scale))
+    resized_height = max(1, int(height * scale))
 
-    warnings: list[str] = []
+    return cv2.resize(
+        image,
+        (resized_width, resized_height),
+        interpolation=cv2.INTER_AREA,
+    )
 
-    if blur_score < 80:
-        warnings.append('Fotoğraf bulanık görünüyor. Lütfen etiketi daha net çekin.')
 
-    if contrast < 35:
-        warnings.append('Kontrast düşük. Etiket yazıları yeterince belirgin olmayabilir.')
-
-    if overexposed_ratio > 0.08:
-        warnings.append('Fotoğrafta parlama/ışık patlaması var. Işığı azaltıp tekrar çekin.')
-
-    if underexposed_ratio > 0.20:
-        warnings.append('Fotoğraf karanlık görünüyor. Daha aydınlık ortamda tekrar çekin.')
-
-    return {
-        'blur_score': round(blur_score, 2),
-        'brightness': round(brightness, 2),
-        'contrast': round(contrast, 2),
-        'overexposed_ratio': round(overexposed_ratio, 4),
-        'underexposed_ratio': round(underexposed_ratio, 4),
-        'warnings': warnings,
-        'is_acceptable': len(warnings) == 0,
-    }
+def prepare_fast_image(image: np.ndarray) -> np.ndarray:
+    resized = resize_to_max_side(image, 1280)
+    return increase_contrast(resized)
 
 
 def resize_image(image: np.ndarray, scale: float = 2.0) -> np.ndarray:
@@ -131,12 +166,13 @@ def resize_image(image: np.ndarray, scale: float = 2.0) -> np.ndarray:
 def increase_contrast(image: np.ndarray) -> np.ndarray:
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l_channel, a_channel, b_channel = cv2.split(lab)
-
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced_l = clahe.apply(l_channel)
 
-    enhanced_lab = cv2.merge((enhanced_l, a_channel, b_channel))
-    return cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
+    return cv2.cvtColor(
+        cv2.merge((enhanced_l, a_channel, b_channel)),
+        cv2.COLOR_LAB2BGR,
+    )
 
 
 def sharpen_image(image: np.ndarray) -> np.ndarray:
@@ -151,22 +187,19 @@ def sharpen_image(image: np.ndarray) -> np.ndarray:
     return cv2.filter2D(image, -1, kernel)
 
 
-def denoise_image(image: np.ndarray) -> np.ndarray:
-    return cv2.fastNlMeansDenoisingColored(
-        image,
-        None,
-        h=8,
-        hColor=8,
-        templateWindowSize=7,
-        searchWindowSize=21,
-    )
-
-
-def threshold_image(image: np.ndarray) -> np.ndarray:
+def preprocess_image(image: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-    thresholded = cv2.adaptiveThreshold(
+    resized = cv2.resize(
         gray,
+        None,
+        fx=2,
+        fy=2,
+        interpolation=cv2.INTER_CUBIC,
+    )
+    blurred = cv2.GaussianBlur(resized, (3, 3), 0)
+
+    return cv2.adaptiveThreshold(
+        blurred,
         255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
@@ -174,84 +207,182 @@ def threshold_image(image: np.ndarray) -> np.ndarray:
         11,
     )
 
-    return cv2.cvtColor(thresholded, cv2.COLOR_GRAY2BGR)
 
+def denoise_threshold_image(image: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    resized = cv2.resize(
+        gray,
+        None,
+        fx=2,
+        fy=2,
+        interpolation=cv2.INTER_CUBIC,
+    )
+    denoised = cv2.fastNlMeansDenoising(
+        resized,
+        None,
+        h=10,
+        templateWindowSize=7,
+        searchWindowSize=21,
+    )
 
-def reduce_glare(image: np.ndarray) -> np.ndarray:
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    h_channel, s_channel, v_channel = cv2.split(hsv)
-
-    glare_mask = cv2.inRange(v_channel, 235, 255)
-    glare_mask = cv2.dilate(glare_mask, np.ones((3, 3), np.uint8), iterations=1)
-
-    repaired = cv2.inpaint(image, glare_mask, 3, cv2.INPAINT_TELEA)
-    return repaired
+    return cv2.adaptiveThreshold(
+        denoised,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        11,
+    )
 
 
 def create_preprocessing_variants(image: np.ndarray) -> list[tuple[str, np.ndarray]]:
     resized = resize_image(image)
-
-    contrast = increase_contrast(resized)
-    denoised = denoise_image(resized)
-    sharpened = sharpen_image(contrast)
-    thresholded = threshold_image(contrast)
-    glare_reduced = reduce_glare(resized)
-    glare_contrast = increase_contrast(glare_reduced)
+    gray_resized = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+    sharpened = sharpen_image(gray_resized)
+    thresholded = preprocess_image(image)
+    denoise_thresholded = denoise_threshold_image(image)
 
     return [
         ('original', image),
-        ('resized', resized),
-        ('contrast', contrast),
-        ('denoise', denoised),
-        ('sharpen', sharpened),
-        ('threshold', thresholded),
-        ('glare_reduced', glare_reduced),
-        ('glare_contrast', glare_contrast),
+        ('gray_resize_2x', gray_resized),
+        ('gray_resize_2x_sharpen', sharpened),
+        ('adaptive_threshold', thresholded),
+        ('denoise_threshold', denoise_thresholded),
     ]
 
 
-def parse_paddle_result(result: Any) -> tuple[list[str], list[float]]:
-    texts: list[str] = []
-    confidences: list[float] = []
+def get_bbox_sort_key(item: Any) -> tuple[float, float]:
+    bbox = item[0] if isinstance(item, (list, tuple)) and item else []
 
-    if not result or not isinstance(result, list):
-        return texts, confidences
+    if not isinstance(bbox, (list, tuple)) or not bbox:
+        return (0, 0)
 
-    first_page = result[0] if len(result) > 0 else []
+    xs = []
+    ys = []
 
-    if not isinstance(first_page, list):
-        return texts, confidences
+    for point in bbox:
+        if isinstance(point, (list, tuple)) and len(point) >= 2:
+            xs.append(float(point[0]))
+            ys.append(float(point[1]))
 
-    for line in first_page:
-        if not isinstance(line, (list, tuple)) or len(line) < 2:
-            continue
+    if not xs or not ys:
+        return (0, 0)
 
-        text_info = line[1]
-
-        if not isinstance(text_info, (list, tuple)) or len(text_info) < 1:
-            continue
-
-        text = text_info[0]
-        confidence = text_info[1] if len(text_info) > 1 else 0
-
-        if isinstance(text, str) and text.strip():
-            texts.append(text.strip())
-
-            try:
-                confidences.append(float(confidence))
-            except (TypeError, ValueError):
-                confidences.append(0.0)
-
-    return texts, confidences
+    return (min(ys), min(xs))
 
 
-def run_ocr(image: np.ndarray) -> tuple[list[str], list[float]]:
+def normalize_ocr_item(item: Any, variant: str, mode: str) -> dict[str, Any] | None:
+    if not isinstance(item, (list, tuple)) or len(item) < 2:
+        return None
+
+    bbox = item[0]
+    text = item[1]
+    confidence = item[2] if len(item) > 2 else 0
+
+    if not isinstance(text, str) or not text.strip():
+        return None
+
+    if not isinstance(bbox, (list, tuple)) or not bbox:
+        return None
+
+    points = []
+
+    for point in bbox:
+        if isinstance(point, (list, tuple)) and len(point) >= 2:
+            points.append([float(point[0]), float(point[1])])
+
+    if not points:
+        return None
+
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    x_min = min(xs)
+    x_max = max(xs)
+    y_min = min(ys)
+    y_max = max(ys)
+
     try:
-        result = ocr.ocr(image, cls=True)
-    except TypeError:
-        result = ocr.ocr(image)
+        conf = float(confidence)
+    except (TypeError, ValueError):
+        conf = 0.0
 
-    return parse_paddle_result(result)
+    return {
+        'text': text.strip(),
+        'conf': conf,
+        'bbox': points,
+        'x_min': x_min,
+        'x_max': x_max,
+        'y_min': y_min,
+        'y_max': y_max,
+        'x_center': (x_min + x_max) / 2,
+        'y_center': (y_min + y_max) / 2,
+        'width': x_max - x_min,
+        'height': y_max - y_min,
+        'variant': variant,
+        'mode': mode,
+    }
+
+
+def boxes_to_lines(boxes: list[dict[str, Any]]) -> list[str]:
+    if not boxes:
+        return []
+
+    heights = sorted(box['height'] for box in boxes if box.get('height', 0) > 0)
+    median_height = heights[len(heights) // 2] if heights else 16
+    tolerance = max(10, median_height * 0.6)
+    rows: list[list[dict[str, Any]]] = []
+
+    for box in sorted(boxes, key=lambda item: item['y_center']):
+        target_row = None
+
+        for row in rows:
+            row_y = sum(item['y_center'] for item in row) / len(row)
+
+            if abs(box['y_center'] - row_y) <= tolerance:
+                target_row = row
+                break
+
+        if target_row is None:
+            rows.append([box])
+        else:
+            target_row.append(box)
+
+    lines = []
+
+    for row in rows:
+        text = ' '.join(box['text'] for box in sorted(row, key=lambda item: item['x_min']))
+
+        if text.strip():
+            lines.append(text.strip())
+
+    return lines
+
+
+def run_easyocr(
+    image: np.ndarray,
+    variant: str,
+    mode: str,
+    options: dict[str, Any],
+) -> tuple[list[str], list[float], list[dict[str, Any]]]:
+    image = np.ascontiguousarray(np.asarray(image, dtype=np.uint8))
+    results = reader.readtext(
+        image,
+        detail=1,
+        paragraph=False,
+        **options,
+    )
+    boxes: list[dict[str, Any]] = []
+
+    for item in sorted(results, key=get_bbox_sort_key):
+        box = normalize_ocr_item(item, variant, mode)
+
+        if box is not None:
+            boxes.append(box)
+
+    lines = boxes_to_lines(boxes)
+    confidences = [box['conf'] for box in boxes]
+
+    return lines, confidences, boxes
 
 
 def score_ocr_result(lines: list[str], confidences: list[float]) -> float:
@@ -259,29 +390,24 @@ def score_ocr_result(lines: list[str], confidences: list[float]) -> float:
         return 0.0
 
     text = '\n'.join(lines).lower()
-
     keyword_score = sum(1 for keyword in OCR_KEYWORDS if keyword in text)
-
     number_matches = re.findall(r'\d+[.,]?\d*', text)
-    number_score = min(len(number_matches), 25)
-
-    gram_matches = re.findall(r'\d+[.,]?\d*\s*(g|gr|mg|kcal|kj)', text)
-    unit_score = min(len(gram_matches), 20)
-
-    avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
-    confidence_score = avg_confidence * 20
-
-    line_score = min(len(lines), 40) * 0.5
-
-    text_length_score = min(len(text), 1200) / 1200 * 10
+    unit_matches = re.findall(r'\d+[.,]?\d*\s*(g|gr|mg|kcal|kj)', text)
+    avg_confidence = sum(confidences) / len(confidences) if confidences else 0
+    garbage_penalty = sum(
+        1
+        for line in lines
+        if len(line.strip()) <= 1 or re.fullmatch(r'[^a-zA-Z0-9]+', line.strip())
+    )
 
     return (
-        keyword_score * 4
-        + number_score * 1.5
-        + unit_score * 2
-        + confidence_score
-        + line_score
-        + text_length_score
+        keyword_score * 5
+        + min(len(number_matches), 35) * 1.4
+        + min(len(unit_matches), 20) * 2
+        + min(len(lines), 70) * 0.7
+        + avg_confidence * 15
+        + min(len(text), 1800) / 1800 * 10
+        - garbage_penalty * 2.5
     )
 
 
@@ -291,66 +417,143 @@ def select_best_ocr_result(
     candidates: list[dict[str, Any]] = []
 
     for variant_name, variant_image in variants:
-        lines, confidences = run_ocr(variant_image)
-        score = score_ocr_result(lines, confidences)
+        for mode_name, options in OCR_MODES:
+            try:
+                lines, confidences, boxes = run_easyocr(
+                    variant_image,
+                    variant_name,
+                    mode_name,
+                    options,
+                )
+            except ValueError:
+                continue
 
-        avg_confidence = (
-            sum(confidences) / len(confidences)
-            if confidences
-            else 0.0
-        )
+            score = score_ocr_result(lines, confidences)
 
-        candidates.append(
-            {
-                'variant': variant_name,
-                'score': round(score, 2),
-                'avg_confidence': round(avg_confidence, 4),
-                'line_count': len(lines),
-                'text': '\n'.join(lines),
-                'lines': lines,
-            }
-        )
+            candidates.append(
+                {
+                    'variant': variant_name,
+                    'mode': mode_name,
+                    'score': round(score, 2),
+                    'avg_confidence': round(
+                        sum(confidences) / len(confidences) if confidences else 0,
+                        4,
+                    ),
+                    'line_count': len(lines),
+                    'text': '\n'.join(lines),
+                    'lines': lines,
+                    'boxes': boxes,
+                }
+            )
 
     candidates = sorted(candidates, key=lambda item: item['score'], reverse=True)
 
-    best = candidates[0] if candidates else {
+    return candidates[0] if candidates else {
         'variant': None,
         'score': 0,
         'avg_confidence': 0,
         'line_count': 0,
         'text': '',
         'lines': [],
+        'boxes': [],
+        'mode': None,
     }
+
+
+def normalize_extract_mode(mode: str | None) -> str:
+    return 'accurate' if mode == 'accurate' else 'fast'
+
+
+def build_ocr_result(
+    lines: list[str],
+    confidences: list[float],
+    boxes: list[dict[str, Any]],
+    variant: str,
+    mode: str,
+) -> dict[str, Any]:
+    score = score_ocr_result(lines, confidences)
 
     return {
-        'best': best,
-        'candidates': candidates,
+        'variant': variant,
+        'mode': mode,
+        'score': round(score, 2),
+        'avg_confidence': round(
+            sum(confidences) / len(confidences) if confidences else 0,
+            4,
+        ),
+        'line_count': len(lines),
+        'text': '\n'.join(lines),
+        'lines': lines,
+        'boxes': boxes,
     }
 
 
-def extract_text_from_image(image_bytes: bytes):
+def extract_fast_ocr(image: np.ndarray) -> dict[str, Any]:
+    fast_image = prepare_fast_image(image)
+    lines, confidences, boxes = run_easyocr(
+        fast_image,
+        'fast_clahe_resize',
+        'fast',
+        FAST_OCR_OPTIONS,
+    )
+
+    return build_ocr_result(
+        lines,
+        confidences,
+        boxes,
+        'fast_clahe_resize',
+        'fast',
+    )
+
+
+def extract_text_from_image(image_bytes: bytes, mode: str = 'fast'):
+    started_at = time.perf_counter()
+    extract_mode = normalize_extract_mode(mode)
     image = decode_image(image_bytes)
+    original_height, original_width = image.shape[:2]
 
-    quality = calculate_image_quality(image)
-    variants = create_preprocessing_variants(image)
-    ocr_selection = select_best_ocr_result(variants)
+    if extract_mode == 'accurate':
+        resized_image = resize_to_max_side(image, 1600)
+        best = select_best_ocr_result(create_preprocessing_variants(resized_image))
+    else:
+        resized_image = resize_to_max_side(image, 1280)
+        best = extract_fast_ocr(image)
 
-    best = ocr_selection['best']
+    resized_height, resized_width = resized_image.shape[:2]
+    processing_time_ms = round((time.perf_counter() - started_at) * 1000, 2)
+
+    print(
+        '[OCR] mode=%s original=%sx%s resized=%sx%s elapsed_ms=%.2f'
+        % (
+            extract_mode,
+            original_width,
+            original_height,
+            resized_width,
+            resized_height,
+            processing_time_ms,
+        )
+    )
 
     return {
         'text': best['text'],
         'lines': best['lines'],
-        'selected_variant': best['variant'],
-        'ocr_score': best['score'],
-        'avg_confidence': best['avg_confidence'],
-        'image_quality': quality,
-        'ocr_candidates': [
-            {
-                'variant': candidate['variant'],
-                'score': candidate['score'],
-                'avg_confidence': candidate['avg_confidence'],
-                'line_count': candidate['line_count'],
-            }
-            for candidate in ocr_selection['candidates']
-        ],
+        'ocr_boxes': best.get('boxes', []),
+        'processing_time_ms': processing_time_ms,
+        'ocr_debug': {
+            'variant': best['variant'],
+            'mode': best.get('mode'),
+            'requested_mode': extract_mode,
+            'score': best['score'],
+            'line_count': best.get('line_count', 0),
+            'avg_confidence': best.get('avg_confidence', 0),
+            'original_size': {
+                'width': original_width,
+                'height': original_height,
+            },
+            'resized_size': {
+                'width': resized_width,
+                'height': resized_height,
+            },
+            'processing_time_ms': processing_time_ms,
+        },
     }

@@ -55,6 +55,7 @@ ALLERGEN_FLAG_COLUMNS = {
     'CELERY': 'contains_celery',
     'SULFITES': 'contains_sulfites',
     'LUPIN': 'contains_lupin',
+    'CRUSTACEAN': 'contains_crustaceans',
     'CRUSTACEANS': 'contains_crustaceans',
     'MOLLUSCS': 'contains_molluscs',
 }
@@ -123,5 +124,3 @@ def save_to_csv(
             writer.writeheader()
 
         writer.writerow(csv_data)
-
-    print('CSV satırı yazıldı:', csv_data)
